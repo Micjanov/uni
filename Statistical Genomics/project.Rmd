@@ -1,0 +1,993 @@
+---
+title: "Project4: Dimension reduction of scRNA-seq data"
+output: html_document
+date: "2022-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#BiocManager::install("scater", force = T)
+
+# Packages
+library(SeuratObject)
+library(scry)
+library(glmpca)
+library(Matrix)
+library(cluster)
+library(NewWave)
+library(mclust)
+library(BiocParallel)
+library(ggplot2)
+library(RColorBrewer)
+library(wesanderson)
+library(microbenchmark)
+library(umap)
+library(scater)
+library(scran)
+library(BiocSingular)
+library(Seurat)
+library(R.utils)
+library(dplyr)
+library(here)
+library(cowplot)
+library(ggpubr)
+library(glmpca)
+library(edgeR)
+library(caret)
+library(randomForest)
+
+getwd()
+```
+
+# Background
+
+The paper of Townes et al. mention the use of Pearson or Deviance residuals of a GLM as a fast way to correct for the mean variance structure in count data prior to PCA. In edgeR 3 types of residuals can be generated, Pearson, Deviance or Quantile residuals. The performance of different types of residuals will be compared for dimension reduction and will be benchmarked to glmPCA, NewWave and regular PCA on log normalized counts. Also, an estimation of the impact for correcting for the known batch effects will be made.
+
+This project contains the following:
+
+1. Retrieving data from NewWave script
+2. Dimension Reduction I
+    1. EdgeR analysis on intercept only
+    2. PCA on lognormcounts
+    3. GLMPCA on lognormcounts
+    4. NewWave analysis
+    5. PCA on three types of residuals
+3. Dimension Reduction II
+    1. EdgeR analysis that corrects for the batch effect
+    2. NewWave analysis
+    3. PCA on three types of residuals
+4. Conclusion
+
+# Data
+
+Dimensionality reduction is a key step for the analysis of single-cell RNA-seq (scRNA-seq) data. Principal component analysis (PCA) is a simple and efficient method that can be employed for this step. However, it suffers from several drawbacks, e.g. it assumes that the data are Gaussian and does not allow to correct for technical variability and biases.
+
+Agostinis, Romualdi, Sales & Risso present **NewWave**. This is a scalable R/Biocondutor package for the dimensionality reduction and batch effect removal of scRNA-seq data. NewWave uses mini-batch optimization and can work with out-of-memory data, enabling users to analyze datasets with millions of cells.
+
+When loading in the data, also a filter step is added, only the most highly variable genes are selected. This makes sense, because these genes are expected to be the most informative when it come to differentiation between cell types.
+
+```{r}
+getPalette = colorRampPalette(brewer.pal(8, "Set2"))
+load("mRNAmix_qc.RData")
+sce2_qc$batch = "CEL-seq2"
+sce8_qc$batch = "Sort-seq"
+
+sce2_qc1 <- logNormCounts(sce2_qc)
+sce8_qc1 <- logNormCounts(sce8_qc)
+
+hvg1 <- getTopHVGs(sce2_qc1, n=4000)
+hvg2 <- getTopHVGs(sce8_qc1, n=4000)
+
+tot_hvg = Reduce(intersect, list(hvg1,hvg2))
+tot_hvg = sample(tot_hvg,1000)
+sce2_qc <- sce2_qc1[tot_hvg,]
+sce8_qc <- sce8_qc1[tot_hvg,]
+
+sce2_qc$label = paste(sce2_qc$H2228_prop,sce2_qc$H1975_prop,sce2_qc$HCC827_prop,sep="_")
+sce8_qc$label = paste(sce8_qc$H2228_prop,sce8_qc$H1975_prop,sce8_qc$HCC827_prop,sep="_")
+
+sce_merge = SingleCellExperiment(assays=list(counts=cbind(counts(sce2_qc),
+                                                          counts(sce8_qc))))
+sce_merge$Batch <- c(sce2_qc$batch,sce8_qc$batch)
+sce_merge$cell_type = c(sce2_qc$label,sce8_qc$label)
+
+sce_merge$Batch<-as.factor(sce_merge$Batch)
+sce_merge$cell_type<-as.factor(sce_merge$cell_type)
+etichette<-as.factor(sce_merge$cell_type)
+
+sce_merge <- logNormCounts(sce_merge)
+
+sce_merge
+head(assays(sce_merge))
+```
+
+# Dimension reduction I
+## EdgeR analysis with intercept only
+
+The first thing done, is calculating the normalization factors. The `computeSumFactors` function calculates scaling normalization factors for the cells.
+
+```{r}
+# Our single cell data: sce_merge
+colData(sce_merge)
+
+# Calculating normalization factors and making DGEList
+y <- computeSumFactors(sce_merge)
+y <- convertTo(y, type = "edgeR")
+
+#MDS-plot
+head(y$samples)
+plotMDS(cpm(y, log=TRUE),col=as.numeric(y$samples$cell_type))
+```
+
+The normalized data is then fitted with an EdgeR model with just an intercept.  So, the different cell types are not modelled nor is their any correction for the possible batch effect (CEL-seq2 vs. Sort-seq). The model still gets a trended variance for the genes which will be used later on for the residuals.
+
+```{r}
+# Design with only intercept
+design <- model.matrix(~1, y$samples)
+
+# Estimate
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+plotBCV(y)
+
+# Fitting
+fit <- glmFit(y, design)
+```
+
+## PCA on lognormcounts
+
+First, regular PCA on the log-transformed/normalized counts has been performed. The plot of the first 2 principal components indicates no clear separation of the 2 batches. However, the cell types seem to already be somewhat separated, especially over the second principal component. Still, a lot of overlap over these cell types is noticed, indicating that the separation is not ideal with regular PCA.
+
+The summarizing and PCA extraction of the data will run 15 times and by timing each time an average compute time can be obtained. This gives a view on how fast and efficient the method performs. The regular PCA is very fast, only requiring on average 0.6 seconds to run.
+
+```{r}
+# PCA
+begin_time <- Sys.time()
+replicate(15,
+          {
+logNcounts <- assays(sce_merge)$logcounts
+pca.logNcounts <- prcomp(logNcounts)
+})
+end_time <- Sys.time()
+(end_time - begin_time)/15
+
+logNcounts <- assays(sce_merge)$logcounts
+pca.logNcounts <- prcomp(logNcounts)
+
+# Plot
+res.logNcounts <- data.frame(pca.logNcounts$rotation[,1], pca.logNcounts$rotation[,2], 
+                             Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.logNcounts) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.logNcounts,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.logNcounts,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.logNcounts,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.logNcounts,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot <- ggarrange(pNW_b, leg, pNW_e, leg1,   
+                      ncol = 2, nrow = 2, 
+                      widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot
+```
+
+Because validating the visible separation in PCA plots can be highly subjective, also a random forest analysis is performed to examine how well it can predict the cell type based on the PCA data. Hereby the following assumption is made: more separation in PCA results will result in a better performing random forest model.
+
+```{r}
+# Random forest analysis
+set.seed(123)  # Set a seed for reproducibility and comparability
+
+split <- createDataPartition(res.logNcounts$Cell_type, p = 0.7, list = FALSE, times = 1) # stratified split
+train_data <- res.logNcounts[split,]
+test_data <- res.logNcounts[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+regular_PCA_intercept <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df <- data.frame(regular_PCA_intercept, row.names=c("accuracy", "mean_precision", "mean_recall", "mean_f1"))
+score_df
+```
+
+## GLM-PCA on lognormcounts
+
+The next method is GLMPCA. In contrast to a classical PCA, GLM-PCA does not assume the data to be normally distributed. The count data is indeed known to not be normally distributed, making GLMPCA seem more appropriate. 
+
+In this case, the count data is modeled by a negative binomial distribution in our GLM-PCA analysis. The plots show again the cells contributions to the first 2 PC's. There seems to be some indication of separation on the batch effect, although it is not that clear. The cell types seem to be separated quite well, especially among the first PC. Overall, the separation on the first 2 PC's of GLM-PCA is better then for a regular PCA, which makes sense because of the violation of normality. Also, the results from the random forest analysis shows quite some improvement in comparison to the regular PCA results. These improvements come at the cost of much longer compute times however: 13 seconds on average compared to the regular PCA's 0.6 seconds.
+
+```{r}
+# GLM-PCA
+begin_time <- Sys.time()
+replicate(15,{
+logNcounts2 <- assays(sce_merge)$logcounts
+glmpca.logNcounts2 <- glmpca(logNcounts, L=2, fam="nb")})
+end_time <- Sys.time()
+(end_time - begin_time)/15
+
+logNcounts2 <- assays(sce_merge)$logcounts
+glmpca.logNcounts2 <- glmpca(logNcounts, L=2, fam="nb")
+
+# Plot
+res.logNcounts2 <- data.frame(glmpca.logNcounts2$factors$dim1, glmpca.logNcounts2$factors$dim2, 
+                             Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.logNcounts2) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.logNcounts2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.logNcounts2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.logNcounts2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.logNcounts2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot2 <- ggarrange(pNW_b, leg, pNW_e, leg1,   
+                       ncol = 2, nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot2
+
+# Random forest analysis
+train_data <- res.logNcounts2[split,]
+test_data <- res.logNcounts2[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$glmPCA_intercept <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+## NewWave analysis
+
+The third method used is from the paper presenting NewWave. Briefly, the log of the expected value of the read count matrix is modeled as a regression of three terms: known cell covariates (batch), known gene covariates (an intercept with the role of normalization) and latent factors that define a low-dimensional space that describe the unknown biological signal. With a high number of cells, these matrices are very large and thus, NewWave employs computational trickery such as shared memory objects, out-of-memory data representations and parallelization to limit the computational problems and make the program more scalable to very large datasets. Like GLM-PCA, it fits the data into a negative binomial distribution model.
+
+There is quite a clear separation on the batch effect here. Similarly, the cell types seem to be separated quite well, albeit not perfectly. Overall, the NewWave analysis seems to give better visual separation then GLM-PCA and PCA. The computational time of 1.2 minutes (on 1 thread) is much slower than that of the PCA and GLM-PCA calculations. But as we only use a relatively small dataset, we have not used NewWave to its full potential on a computational level such as considering memory efficiency etc.
+
+```{r}
+# NewWave
+begin_time <- Sys.time()
+replicate(15,{
+finNew <- newFit(sce_merge, K=10, X = design, commondispersion = F,
+                 children = 1, n_gene_par = 100, 
+                 n_cell_par = ncol(sce_merge)/10)
+
+data.umap = umap(finNew@W)})
+end_time <- Sys.time()
+(end_time - begin_time)/15
+
+finNew <- newFit(sce_merge, K=10, X = design, commondispersion = F,
+                 children = 8, n_gene_par = 100, 
+                 n_cell_par = ncol(sce_merge)/10)
+
+data.umap = umap(finNew@W)
+
+# Plot
+res.NewWave = data.frame(data.umap$layout,Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.NewWave) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.NewWave,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.NewWave,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.NewWave,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.NewWave,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot3 <- ggarrange(pNW_b, leg, pNW_e, leg1,   
+                       ncol = 2, nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot3
+
+# Random forest analysis
+train_data <- res.NewWave[split,]
+test_data <- res.NewWave[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$newWave_intercept <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+The options for NewWave's parallelization are tested here. Because the system where this was tested on has 4 cores and 8 threads, the amount of threads is set to 8. There is much improvement in the runtime, it might show much more potential with high-scale datasets and computations.
+```{r}
+begin_time <- Sys.time()
+replicate(15,{
+finNew <- newFit(sce_merge, K=10, X = design, commondispersion = F,
+                 children = 8, n_gene_par = 100, 
+                 n_cell_par = ncol(sce_merge)/10)
+
+data.umap = umap(finNew@W)})
+end_time <- Sys.time()
+(end_time - begin_time)/15
+```
+
+
+As an experiment, the performance of the random forest model is checked if it is beneficial if it has more principal components to work with. Surprisingly, the model with GLM-PCA data of 15 components performs worse than that of 2 components. The other models seem to perform significantly better.
+
+```{r}
+# See if random forest is better with more components (15)
+# Regular pca on lognormalized counts
+res.logNcounts <- data.frame(pca.logNcounts$rotation[,1], pca.logNcounts$rotation[,2], pca.logNcounts$rotation[,3], pca.logNcounts$rotation[,4], pca.logNcounts$rotation[,5], pca.logNcounts$rotation[,6], pca.logNcounts$rotation[,7], pca.logNcounts$rotation[,8], pca.logNcounts$rotation[,9], pca.logNcounts$rotation[,10], pca.logNcounts$rotation[,11], pca.logNcounts$rotation[,12], pca.logNcounts$rotation[,13], pca.logNcounts$rotation[,14], pca.logNcounts$rotation[,15],
+                             Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.logNcounts) <- c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15", "Batch", "Cell_type")
+
+split <- createDataPartition(res.logNcounts$Cell_type, p = 0.7, list = FALSE, times = 1) # stratified split
+train_data <- res.logNcounts[split,]
+test_data <- res.logNcounts[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2+X3+X4+X5+X6+X7+X8+X9+X10+X11+X12+X13+X14+X15, data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$regular_PCA_intercept_15D <- c(accuracy, mean_precision, mean_recall, mean_f1)
+
+# GLM-PCA on lognormalized counts
+glmpca.logNcounts2 <- glmpca(logNcounts, L=15, fam="nb")
+res.logNcounts2 <- data.frame(glmpca.logNcounts2$factors$dim1, glmpca.logNcounts2$factors$dim2, glmpca.logNcounts2$factors$dim3, glmpca.logNcounts2$factors$dim4, glmpca.logNcounts2$factors$dim5, glmpca.logNcounts2$factors$dim6, glmpca.logNcounts2$factors$dim7, glmpca.logNcounts2$factors$dim8, glmpca.logNcounts2$factors$dim9, glmpca.logNcounts2$factors$dim10, glmpca.logNcounts2$factors$dim11, glmpca.logNcounts2$factors$dim12, glmpca.logNcounts2$factors$dim13, glmpca.logNcounts2$factors$dim14, glmpca.logNcounts2$factors$dim15,
+                             Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.logNcounts2) <- c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15", "Batch", "Cell_type")
+
+train_data <- res.logNcounts2[split,]
+test_data <- res.logNcounts2[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2+X3+X4+X5+X6+X7+X8+X9+X10+X11+X12+X13+X14+X15 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$glmPCA_intercept_15D <- c(accuracy, mean_precision, mean_recall, mean_f1)
+
+# Newwave
+data.umap = umap(finNew@W, n_components = 15)
+res.NewWave = data.frame(data.umap$layout,Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.NewWave) <- c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15", "Batch", "Cell_type")
+
+train_data <- res.NewWave[split,]
+test_data <- res.NewWave[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2+X3+X4+X5+X6+X7+X8+X9+X10+X11+X12+X13+X14+X15 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$newWave_intercept_15D <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+## PCA on three types of residuals
+
+Now, the main part of our actual project can be executed. The previous methods (regular PCA, GLM-PCA and NewWave) are compared to a regular PCA on the residuals from the EdgeR model with an intercept only. This intercept-only EdgeR model thus models a global average over the different cell types + batch effects. Also the dispersion over the genes is still modeled (in contrast to a standard linear model with just an intercept). A correction for the gene-wise dispersion can be made when calculating the residuals. The basic idea is that these gene-wise overdispersion corrected residuals might vary differently over the different cell types and batches, which can be uncovered by a regular PCA. The normality assumption of a regular PCA are expected to hold, because the residuals are corrected for the overdispersion.
+
+### Pearson residuals
+
+The first residual is the Pearson residual. This comes down to the difference between the observed count and the expected count according to the model fit, standardized by the model variance. So, for the EdgeR model with counts $y_{ij}$, mean $\mu$ and overdispersion parameter $\phi$, the Pearson residual can be expressed as follows:
+
+$$
+Pearson = \frac{y_{ij} - \mu_{ij}}{\sqrt{\mu_{ij} + \phi * \mu^2}}
+$$
+
+The denominator thus corrects for the trended overdispersion. At first glance, the PCA on these Pearson residuals indeed seems to show some separation between the two batches. Also, it separates the cell types quite well, although seemingly less well then on the NewWave plot. As for the random forest prediction model, this one performed better than the one trained on regular PCA data of log-transformed counts, but worse than the ones trained on GLM-PCA and NewWave dimension reductions.
+
+```{r}
+# Pearson residuals
+yg <- fit$counts
+mu <- fit$fitted.values
+phi <- fit$dispersion
+pearsonres <- (yg-mu) / sqrt(mu+phi*mu^2)
+
+# PCA
+pca.pearson <- prcomp(pearsonres)
+
+# Plot
+res.pearson <- data.frame(pca.pearson$rotation[,1], pca.pearson$rotation[,2], 
+                          Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.pearson) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.pearson,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.pearson,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.pearson,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.pearson,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot4 <- ggarrange(pNW_b, leg,pNW_e,leg1,   
+                       ncol = 2, nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot4
+
+# Random forest analysis
+train_data <- res.pearson[split,]
+test_data <- res.pearson[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$pearson_intercept <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+### Deviance residuals
+
+Another residual that measures the deviation of our intercept model is the deviance residual. However, the PCA on the deviance residuals seems to separate the cell types and batches much worse then with the Pearson residuals. Possibly, this is because the deviance residuals are not standardized, in contrast to the Pearson residuals. This non-standardization would violate the normality assumption of PCA. On top of that, the random forest model trained on this data performed very poorly in comparison to all other methods.
+
+```{r}
+# Deviance residuals
+devianceres <- nbinomUnitDeviance(yg,mu,phi)
+
+# PCA
+pca.deviance <- prcomp(devianceres)
+
+# Plot
+res.deviance <- data.frame(pca.deviance$rotation[,1], pca.deviance$rotation[,2], 
+                          Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.deviance) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.deviance,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.deviance,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.deviance,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.deviance,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot5 <- ggarrange(pNW_b, leg,pNW_e,leg1,   
+                       ncol = 2,  nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot5
+
+# Random forest analysis
+train_data <- res.deviance[split,]
+test_data <- res.deviance[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$deviance_intercept <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+### Quantile residuals
+
+Lastly, the quantile residuals are calculated. The approach is again the same as with the 2 previous residuals. The PCA plots look very similar to the the Pearson residual ones, suggesting similar performance. Again, just as the Pearson residuals and in contrast to the deviance residuals, these quantile residuals are standardized. This supports the model where in the standardization is necessary for a good separation. The random forest model suggests that that it performs only slightly poorer than regular PCA of log-transformed count data and that of Pearson residuals.
+
+```{r}
+# Quantile residuals
+quantileres <- zscoreNBinom(yg,mu,size=1/phi)
+
+# PCA
+pca.quantile <- prcomp(quantileres)
+
+# Plot
+res.quantile <- data.frame(pca.quantile$rotation[,1], pca.quantile$rotation[,2], 
+                          Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.quantile) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.quantile,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.quantile,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.quantile,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.quantile,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot6 <- ggarrange(pNW_b, leg,pNW_e,leg1,   
+                       ncol = 2,  nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot6
+
+# Random forest analysis
+train_data <- res.quantile[split,]
+test_data <- res.quantile[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$quantile_intercept <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+# Dimension reduction II
+## EdgeR analysis that corrects for the batch effect
+
+In the second part, roughly the same protocol is used as in the first part, with the difference that we correct for batch effect. It is then interesting to see if the removal of this technical/batch effect variation allows for better separation of the cell types.
+
+```{r}
+# Our input DGEList stays the same (y)
+# Only differences in design of our model: correcting for batch effect
+# Design 
+design2 <- model.matrix(~Batch, y$samples)
+
+# Estimate
+y2 <- estimateDisp(y, design2)
+summary(y2$trended.dispersion)
+plotBCV(y2)
+
+# Fitting
+fit2 <- glmFit(y2, design2)
+```
+
+## NewWave analysis
+
+First, the NewWave analysis is runned again. The batch effect plot suggest that the model indeed corrected for the batch effect, since the 2 batches are not separated anymore. It seems that the cell types are also separated slightly better into clear groups. The random forest analysis does not show improvement, however.
+
+```{r}
+# NewWave
+finNew2 <- newFit(sce_merge, K=10, X = design2, commondispersion = F,
+                  children = 8, n_gene_par = 100, 
+                  n_cell_par = ncol(sce_merge)/10)
+
+data.umap2 = umap(finNew2@W)
+
+# Plot
+res.NewWave2 = data.frame(data.umap2$layout,Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.NewWave2) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.NewWave2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.NewWave2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.NewWave2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.NewWave2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot7 <- ggarrange(pNW_b, leg, pNW_e, leg1,   
+                       ncol = 2, nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot7
+
+# Random forest analysis
+train_data <- res.NewWave2[split,]
+test_data <- res.NewWave2[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$newWave_batch_correct <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+## PCA on three types of residuals
+### Pearson residuals
+
+Again, the Pearson residual batch-effect plot shows that the batch effect is corrected. The cell type plot does not show a clear and better separation that can be spotted visually. The random forest prediction analysis also shows no change in its ability to separate cell types compared to the non-corrected one. 
+
+```{r}
+# Pearson residuals
+yg <- fit2$counts
+mu <- fit2$fitted.values
+phi <- fit2$dispersion
+pearsonres2 <- (yg-mu) / sqrt(mu+phi*mu^2)
+
+# PCA
+pca.pearson2 <- prcomp(pearsonres2)
+
+# Plot
+res.pearson2 <- data.frame(pca.pearson2$rotation[,1], pca.pearson2$rotation[,2], 
+                          Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.pearson2) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.pearson2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.pearson2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.pearson2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.pearson2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot8 <- ggarrange(pNW_b, leg,pNW_e,leg1,   
+                       ncol = 2, nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot8
+
+# Random forest analysis
+train_data <- res.pearson2[split,]
+test_data <- res.pearson2[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$pearson_batch_correct <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+### Deviance residuals
+
+Batch-correction of the deviance residuals shows slight improvement, but in overall, it still does not allow for a good separation of the cell types compared to all other methods. 
+
+```{r}
+# Deviance residuals
+devianceres2 <- nbinomUnitDeviance(yg,mu,phi)
+
+# PCA
+pca.deviance2 <- prcomp(devianceres2)
+
+# Plot
+res.deviance2 <- data.frame(pca.deviance2$rotation[,1], pca.deviance2$rotation[,2], 
+                          Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.deviance2) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.deviance2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.deviance2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.deviance2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.deviance2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot9 <- ggarrange(pNW_b, leg,pNW_e,leg1,   
+                       ncol = 2,  nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot9
+
+# Random forest analysis
+train_data <- res.deviance2[split,]
+test_data <- res.deviance2[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$deviance_batch_corrected <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+### Quantile residuals
+
+Batch-corrected quantile residuals again perform very similarly to batch-correct Pearson residuals. 
+
+```{r}
+# Quantile residuals
+quantileres2 <- zscoreNBinom(yg,mu,size=1/phi)
+
+# PCA
+pca.quantile2 <- prcomp(quantileres2)
+
+# Plot
+res.quantile2 <- data.frame(pca.quantile2$rotation[,1], pca.quantile2$rotation[,2], 
+                          Batch = sce_merge$Batch, Cell_type = etichette)
+colnames(res.quantile2) <- c("X1", "X2", "Batch", "Cell_type")
+
+pNW_b = ggplot(res.quantile2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.title = element_text("Batch"))
+leg <- get_legend(pNW_b)
+pNW_b = ggplot(res.quantile2,aes(x=X1,y=X2,col=Batch))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())
+
+pNW_e = ggplot(res.quantile2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.title = element_text("Cell type"))+scale_color_manual(values=getPalette(20))
+leg1 <- get_legend(pNW_e)
+pNW_e = ggplot(res.quantile2,aes(x=X1,y=X2,col=Cell_type))+geom_point()+theme(legend.position = "none",legend.key.size = unit(1.1, "cm"),axis.title = element_blank())+scale_color_manual(values=getPalette(20))
+
+SuppPlot10 <- ggarrange(pNW_b, leg,pNW_e,leg1,   
+                       ncol = 2,  nrow = 2, 
+                       widths = c(2.5,2.5,1), font.label= list(size=8)) 
+SuppPlot10
+
+# Random forest analysis
+train_data <- res.quantile2[split,]
+test_data <- res.quantile2[-split,]
+
+# Build the random forest model
+model <- randomForest(formula = Cell_type ~X1+X2 , data = train_data, ntree = 10)
+
+# Make predictions on the test set
+predictions <- predict(model, newdata = test_data)
+
+# Calculate the accuracy score
+accuracy <- sum(predictions == test_data$Cell_type) / nrow(test_data)
+
+
+confusion_matrix <- table(predictions, test_data$Cell_type)
+
+# Extract the true and false positive and negative counts for each label
+tp <- diag(confusion_matrix)
+fp <- colSums(confusion_matrix) - tp
+fn <- rowSums(confusion_matrix) - tp
+tn <- sum(confusion_matrix) - tp - fp - fn
+
+# Calculate the precision, recall, and F1 scores for each label
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1 <- 2 * precision * recall / (precision + recall)
+
+# Calculate the average precision, recall, and F1 scores
+mean_precision <- mean(precision)
+mean_recall <- mean(recall)
+mean_f1 <- mean(f1)
+
+score_df$quantile_batch_corrected <- c(accuracy, mean_precision, mean_recall, mean_f1)
+score_df
+```
+
+# Conclusion
+
+Comparing the performance of the different types of residuals used for a standard PCA with no intercept indicated that the Pearson and quantile residuals offered a much better result than the deviance residuals. This leads to the assumption that standardization, which is performed in quantile and pearson residuals, is important for the separation of the different clusters. The Pearson and quantile residuals did show an improvement in performance with regular PCA on log normalized counts. GLM-PCA and NewWave however still outperformed the different residuals.
+
+When correcting for the batch effects in the model, the methods showed a better batch-correction when plotted, but the ability to separate cell types compared to the non-corrected one did not improve.
+
+Overall, the NewWave analysis outperforms most methods for dimension reduction analyses. However, the computational time is much larger for this method. For a larger data set this could be an issue, but this time can be reduced by the NewWave ability to parallelize the computations on multiple cores and other computational abilities. If time and resources are limited, regular PCA on Pearson or quantile residuals can be a good alternative for a fast and quality method.
+
+
+
+
+
